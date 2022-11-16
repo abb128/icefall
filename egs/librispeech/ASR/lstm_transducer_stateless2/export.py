@@ -313,10 +313,10 @@ class MergedEncoder(nn.Module):
     the encoder_out is pre-projected according to the joiner.
     """
 
-    def __init__(self, encoder: nn.Module, joiner: nn.Module) -> None:
+    def __init__(self, encoder: nn.Module, encoder_proj: nn.Module) -> None:
         super().__init__()
         self.encoder = encoder
-        self.encoder_proj = joiner.encoder_proj
+        self.encoder_proj = encoder_proj
 
     def forward(
         self, x: torch.Tensor, h: torch.Tensor, c: torch.Tensor
@@ -330,41 +330,36 @@ class MergedEncoder(nn.Module):
         return x, new_states[0], new_states[1]
 
 
-class MergedJoiner(nn.Module):
+class MergedDecoder(nn.Module):
     """
-    This combines the decoder and joiner to provide a simplified model that
-    takes context and pre-projected encoder_out as input, and then runs
-    decoder -> joiner.decoder_proj -> joiner sequentially.
+    This combines the decoder and joiner to provide a simplified model where
+    the decoder_out is pre-projected according to the joiner.
     """
 
-    def __init__(self, decoder: nn.Module, joiner: nn.Module) -> None:
+    def __init__(self, decoder: nn.Module, decoder_proj: nn.Module) -> None:
         super().__init__()
         self.decoder = decoder
-        self.joiner = joiner
+        self.decoder_proj = decoder_proj
 
-    def forward(
-        self, context: torch.Tensor, encoder_out: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
         need_pad = False  # Always False, so we can use torch.jit.trace() here
-        project_input = False
 
         decoder_out = self.decoder(context, need_pad)
-        decoder_out = self.joiner.decoder_proj(decoder_out)
+        decoder_out = self.decoder_proj(decoder_out)
 
-        joiner_out = self.joiner(encoder_out, decoder_out, project_input)
+        decoder_out = decoder_out.squeeze(1)
 
-        joiner_out = joiner_out.squeeze(0)
-
-        return joiner_out
+        return decoder_out
 
 
 def export_model_onnx(
     model: nn.Module, out_path: str, opset_version: int = 11
 ) -> None:
     """Export the given model to ONNX format.
-    This exports the model as two networks:
+    This exports the model as 3 networks:
         - encoder.onnx, which combines the encoder and joiner's encoder_proj
-        - joiner.onnx, which combines the decoder, decoder_proj and joiner.
+        - decoder.onnx, which combines the decoder and joiner's decoder_proj
+        - joiner.onnx, which takes encoder and decoder outputs
 
 
     The encoder network has 3 inputs:
@@ -383,12 +378,17 @@ def export_model_onnx(
     Note: The warmup argument is fixed to 1.
 
 
-    The joiner network has 2 inputs:
+    The decoder network has 1 inputs:
         - context: a torch.int64 tensor of shape (N, decoder_model.context_size)
+    and has one output:
+        - decoder_out: a tensor of shape (N, joiner_dim)
+
+
+    The joiner network has 2 inputs:
         - encoder_out: a tensor of shape (N, joiner_dim)
+        - decoder_out: a tensor of shape (N, joiner_dim)
     and has one output:
         - logit: a tensor of shape (N, vocab_size)
-
 
     Args:
       model:
@@ -399,23 +399,24 @@ def export_model_onnx(
         The opset version to use.
     """
     encoder_filename = out_path / "encoder.onnx"
+    decoder_filename = out_path / "decoder.onnx"
     joiner_filename = out_path / "joiner.onnx"
 
-    onnx_encoder = MergedEncoder(model.encoder, model.joiner)
-    onnx_joiner = MergedJoiner(model.decoder, model.joiner)
+    onnx_encoder = MergedEncoder(model.encoder, model.joiner.encoder_proj)
+    onnx_decoder = MergedDecoder(model.decoder, model.joiner.decoder_proj)
     onnx_encoder.eval()
-    onnx_joiner.eval()
+    onnx_decoder.eval()
 
     N = 1
     SEGMENT_SIZE = 9
     MEL_FEATURES = 80
 
+    # Export encoder
     x = torch.zeros(N, SEGMENT_SIZE, MEL_FEATURES, dtype=torch.float32)
     h = torch.rand(model.encoder.num_encoder_layers, N, model.encoder.d_model)
     c = torch.rand(
         model.encoder.num_encoder_layers, N, model.encoder.rnn_hidden_size
     )
-
     torch.onnx.export(
         onnx_encoder,  # use torch.jit.trace() internally
         (x, h, c),
@@ -435,21 +436,43 @@ def export_model_onnx(
     )
     logging.info(f"Saved to {encoder_filename}")
 
+    # Export decoder
     context = torch.zeros(N, model.decoder.context_size, dtype=torch.int64)
+    torch.onnx.export(
+        onnx_decoder,  # use torch.jit.trace() internally
+        (context),
+        decoder_filename,
+        verbose=False,
+        opset_version=opset_version,
+        input_names=["context"],
+        output_names=["decoder_out"],
+        dynamic_axes={
+            "context": {0: "N"},
+            "decoder_out": {0: "N"},
+        },
+    )
+    logging.info(f"Saved to {decoder_filename}")
+
+    # Export joiner
     encoder_out, _, _ = onnx_encoder(x, h, c)
     encoder_out = encoder_out.squeeze(0)
 
+    decoder_out = onnx_decoder(context)
+    decoder_out = decoder_out.squeeze(1)
+
+    project_input = False
+
     torch.onnx.export(
-        onnx_joiner,  # use torch.jit.trace() internally
-        (context, encoder_out),
+        model.joiner,  # use torch.jit.trace() internally
+        (encoder_out, decoder_out, project_input),
         joiner_filename,
         verbose=False,
         opset_version=opset_version,
-        input_names=["context", "encoder_out"],
+        input_names=["encoder_out", "decoder_out"],
         output_names=["logits"],
         dynamic_axes={
-            "context": {0: "N"},
             "encoder_out": {0: "N"},
+            "decoder_out": {0: "N"},
             "logits": {0: "N"},
         },
     )

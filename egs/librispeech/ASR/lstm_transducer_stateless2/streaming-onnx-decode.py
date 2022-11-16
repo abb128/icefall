@@ -29,6 +29,7 @@ Usage of this script:
 
 ./lstm_transducer_stateless2/onnx-streaming-decode.py \
   --encoder-model-filename ./lstm_transducer_stateless2/exp/encoder.onnx \
+  --decoder-model-filename ./lstm_transducer_stateless2/exp/encoder.onnx \
   --joiner-model-filename ./lstm_transducer_stateless2/exp/joiner.onnx \
   --bpe-model ./data/lang_bpe_500/bpe.model \
   /path/to/foo.wav \
@@ -61,6 +62,13 @@ def get_args():
         type=str,
         required=True,
         help="Path to the encoder onnx model. ",
+    )
+
+    parser.add_argument(
+        "--decoder-model-filename",
+        type=str,
+        required=True,
+        help="Path to the decoder onnx model. ",
     )
 
     parser.add_argument(
@@ -135,11 +143,18 @@ class Model:
         self.session_opts = session_opts
 
         self.init_encoder(args)
+        self.init_decoder(args)
         self.init_joiner(args)
 
     def init_encoder(self, args):
         self.encoder = ort.InferenceSession(
             args.encoder_model_filename,
+            sess_options=self.session_opts,
+        )
+
+    def init_decoder(self, args):
+        self.decoder = ort.InferenceSession(
+            args.decoder_model_filename,
             sess_options=self.session_opts,
         )
 
@@ -187,16 +202,34 @@ class Model:
             torch.from_numpy(next_c0),
         )
 
-    def run_joiner(
-        self,
-        context: torch.Tensor,
-        encoder_out: torch.Tensor,
-    ) -> torch.Tensor:
+    def run_decoder(self, context: torch.Tensor) -> torch.Tensor:
         """
         Args:
           context:
             A tensor of shape (N, context_size). Its dtype is torch.int64.
+        Returns:
+          Return a tensor of shape (N, decoder_out_dim).
+        """
+        decoder_input_nodes = self.decoder.get_inputs()
+        decoder_output_nodes = self.decoder.get_outputs()
+
+        decoder_out = self.decoder.run(
+            [decoder_output_nodes[0].name],
+            {
+                decoder_input_nodes[0].name: context.numpy(),
+            },
+        )[0]
+
+        return torch.from_numpy(decoder_out)
+
+    def run_joiner(
+        self, encoder_out: torch.Tensor, decoder_out: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
           encoder_out:
+            A tensor of shape (N, joiner_dim)
+          decoder_out:
             A tensor of shape (N, joiner_dim)
         Returns:
           Return a tensor of shape (N, vocab_size)
@@ -207,8 +240,8 @@ class Model:
         logits = self.joiner.run(
             [joiner_output_nodes[0].name],
             {
-                joiner_input_nodes[0].name: context.numpy(),
-                joiner_input_nodes[1].name: encoder_out.numpy(),
+                joiner_input_nodes[0].name: encoder_out.numpy(),
+                joiner_input_nodes[1].name: decoder_out.numpy(),
             },
         )[0]
 
@@ -237,6 +270,7 @@ def create_streaming_feature_extractor() -> OnlineFeature:
 def greedy_search(
     model: Model,
     encoder_out: torch.Tensor,
+    decoder_out: Optional[torch.Tensor] = None,
     hyp: Optional[List[int]] = None,
 ):
     assert encoder_out.ndim == 2
@@ -244,19 +278,27 @@ def greedy_search(
     context_size = 2
     blank_id = 0
 
-    if hyp is None:
+    if decoder_out is None:
+        assert hyp is None, hyp
         hyp = [blank_id] * context_size
+        decoder_input = torch.tensor(
+            [hyp], dtype=torch.int64
+        )  # (1, context_size)
+        decoder_out = model.run_decoder(decoder_input)
+    else:
+        assert decoder_out.shape[0] == 1
+        assert hyp is not None, hyp
 
-    context = hyp[-context_size:]
-    context = torch.tensor([context], dtype=torch.int64)
-
-    joiner_out = model.run_joiner(context, encoder_out)
+    joiner_out = model.run_joiner(encoder_out, decoder_out)
     y = joiner_out.squeeze(0).argmax(dim=0).item()
 
     if y != blank_id:
         hyp.append(y)
+        decoder_input = hyp[-context_size:]
+        decoder_input = torch.tensor([decoder_input], dtype=torch.int64)
+        decoder_out = model.run_decoder(decoder_input)
 
-    return hyp
+    return hyp, decoder_out
 
 
 def main():
@@ -290,6 +332,7 @@ def main():
     c0 = torch.zeros(num_encoder_layers, batch_size, rnn_hidden_size)
 
     hyp = None
+    decoder_out = None
 
     num_processed_frames = 0
     segment = 9
@@ -315,7 +358,9 @@ def main():
             num_processed_frames += offset
             frames = torch.cat(frames, dim=0).unsqueeze(0)
             encoder_out, h0, c0 = model.run_encoder(frames, h0, c0)
-            hyp = greedy_search(model, encoder_out.squeeze(0), hyp)
+            hyp, decoder_out = greedy_search(
+                model, encoder_out.squeeze(0), decoder_out, hyp
+            )
     online_fbank.accept_waveform(
         sampling_rate=sample_rate, waveform=torch.zeros(5000, dtype=torch.float)
     )
@@ -328,7 +373,9 @@ def main():
         num_processed_frames += offset
         frames = torch.cat(frames, dim=0).unsqueeze(0)
         encoder_out, h0, c0 = model.run_encoder(frames, h0, c0)
-        hyp = greedy_search(model, encoder_out.squeeze(0), hyp)
+        hyp, decoder_out = greedy_search(
+            model, encoder_out.squeeze(0), decoder_out, hyp
+        )
 
     context_size = 2
 
