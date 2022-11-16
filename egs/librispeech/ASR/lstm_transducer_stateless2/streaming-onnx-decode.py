@@ -29,10 +29,7 @@ Usage of this script:
 
 ./lstm_transducer_stateless2/onnx-streaming-decode.py \
   --encoder-model-filename ./lstm_transducer_stateless2/exp/encoder.onnx \
-  --decoder-model-filename ./lstm_transducer_stateless2/exp/decoder.onnx \
   --joiner-model-filename ./lstm_transducer_stateless2/exp/joiner.onnx \
-  --joiner-encoder-proj-model-filename ./lstm_transducer_stateless2/exp/joiner_encoder_proj.onnx \
-  --joiner-decoder-proj-model-filename ./lstm_transducer_stateless2/exp/joiner_decoder_proj.onnx \
   --bpe-model ./data/lang_bpe_500/bpe.model \
   /path/to/foo.wav \
   /path/to/bar.wav
@@ -60,23 +57,10 @@ def get_args():
     )
 
     parser.add_argument(
-        "--bpe-model-filename",
-        type=str,
-        help="Path to bpe.model",
-    )
-
-    parser.add_argument(
         "--encoder-model-filename",
         type=str,
         required=True,
         help="Path to the encoder onnx model. ",
-    )
-
-    parser.add_argument(
-        "--decoder-model-filename",
-        type=str,
-        required=True,
-        help="Path to the decoder onnx model. ",
     )
 
     parser.add_argument(
@@ -87,22 +71,9 @@ def get_args():
     )
 
     parser.add_argument(
-        "--joiner-encoder-proj-model-filename",
-        type=str,
-        required=True,
-        help="Path to the joiner encoder_proj onnx model. ",
-    )
-
-    parser.add_argument(
-        "--joiner-decoder-proj-model-filename",
-        type=str,
-        required=True,
-        help="Path to the joiner decoder_proj onnx model. ",
-    )
-
-    parser.add_argument(
         "--bpe-model",
         type=str,
+        required=True,
         help="""Path to bpe.model.""",
     )
 
@@ -164,10 +135,7 @@ class Model:
         self.session_opts = session_opts
 
         self.init_encoder(args)
-        self.init_decoder(args)
         self.init_joiner(args)
-        self.init_joiner_encoder_proj(args)
-        self.init_joiner_decoder_proj(args)
 
     def init_encoder(self, args):
         self.encoder = ort.InferenceSession(
@@ -175,27 +143,9 @@ class Model:
             sess_options=self.session_opts,
         )
 
-    def init_decoder(self, args):
-        self.decoder = ort.InferenceSession(
-            args.decoder_model_filename,
-            sess_options=self.session_opts,
-        )
-
     def init_joiner(self, args):
         self.joiner = ort.InferenceSession(
             args.joiner_model_filename,
-            sess_options=self.session_opts,
-        )
-
-    def init_joiner_encoder_proj(self, args):
-        self.joiner_encoder_proj = ort.InferenceSession(
-            args.joiner_encoder_proj_model_filename,
-            sess_options=self.session_opts,
-        )
-
-    def init_joiner_decoder_proj(self, args):
-        self.joiner_decoder_proj = ort.InferenceSession(
-            args.joiner_decoder_proj_model_filename,
             sess_options=self.session_opts,
         )
 
@@ -212,26 +162,23 @@ class Model:
             A tensor of shape (num_layers, N, hidden_size)
         Returns:
           Return a tuple containing:
-            - encoder_out: A tensor of shape (N, T', C')
+            - encoder_out: A tensor of shape (N, T', joiner_dim)
             - next_h0: A tensor of shape (num_layers, N, proj_size)
             - next_c0: A tensor of shape (num_layers, N, hidden_size)
         """
         encoder_input_nodes = self.encoder.get_inputs()
         encoder_out_nodes = self.encoder.get_outputs()
-        x_lens = torch.tensor([x.size(1)], dtype=torch.int64)
 
-        encoder_out, encoder_out_lens, next_h0, next_c0 = self.encoder.run(
+        encoder_out, next_h0, next_c0 = self.encoder.run(
             [
                 encoder_out_nodes[0].name,
                 encoder_out_nodes[1].name,
                 encoder_out_nodes[2].name,
-                encoder_out_nodes[3].name,
             ],
             {
                 encoder_input_nodes[0].name: x.numpy(),
-                encoder_input_nodes[1].name: x_lens.numpy(),
-                encoder_input_nodes[2].name: h0.numpy(),
-                encoder_input_nodes[3].name: c0.numpy(),
+                encoder_input_nodes[1].name: h0.numpy(),
+                encoder_input_nodes[2].name: c0.numpy(),
             },
         )
         return (
@@ -240,38 +187,16 @@ class Model:
             torch.from_numpy(next_c0),
         )
 
-    def run_decoder(self, decoder_input: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-          decoder_input:
-            A tensor of shape (N, context_size). Its dtype is torch.int64.
-        Returns:
-          Return a tensor of shape (N, 1, decoder_out_dim).
-        """
-        decoder_input_nodes = self.decoder.get_inputs()
-        decoder_output_nodes = self.decoder.get_outputs()
-
-        decoder_out = self.decoder.run(
-            [decoder_output_nodes[0].name],
-            {
-                decoder_input_nodes[0].name: decoder_input.numpy(),
-            },
-        )[0]
-
-        return self.run_joiner_decoder_proj(
-            torch.from_numpy(decoder_out).squeeze(1)
-        )
-
     def run_joiner(
         self,
-        projected_encoder_out: torch.Tensor,
-        projected_decoder_out: torch.Tensor,
+        context: torch.Tensor,
+        encoder_out: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
-          projected_encoder_out:
-            A tensor of shape (N, joiner_dim)
-          projected_decoder_out:
+          context:
+            A tensor of shape (N, context_size). Its dtype is torch.int64.
+          encoder_out:
             A tensor of shape (N, joiner_dim)
         Returns:
           Return a tensor of shape (N, vocab_size)
@@ -282,58 +207,12 @@ class Model:
         logits = self.joiner.run(
             [joiner_output_nodes[0].name],
             {
-                joiner_input_nodes[0].name: projected_encoder_out.numpy(),
-                joiner_input_nodes[1].name: projected_decoder_out.numpy(),
+                joiner_input_nodes[0].name: context.numpy(),
+                joiner_input_nodes[1].name: encoder_out.numpy(),
             },
         )[0]
 
         return torch.from_numpy(logits)
-
-    def run_joiner_encoder_proj(
-        self,
-        encoder_out: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-          encoder_out:
-            A tensor of shape (N, encoder_out_dim)
-        Returns:
-            A tensor of shape (N, joiner_dim)
-        """
-
-        projected_encoder_out = self.joiner_encoder_proj.run(
-            [self.joiner_encoder_proj.get_outputs()[0].name],
-            {
-                self.joiner_encoder_proj.get_inputs()[
-                    0
-                ].name: encoder_out.numpy()
-            },
-        )[0]
-
-        return torch.from_numpy(projected_encoder_out)
-
-    def run_joiner_decoder_proj(
-        self,
-        decoder_out: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-          decoder_out:
-            A tensor of shape (N, decoder_out_dim)
-        Returns:
-            A tensor of shape (N, joiner_dim)
-        """
-
-        projected_decoder_out = self.joiner_decoder_proj.run(
-            [self.joiner_decoder_proj.get_outputs()[0].name],
-            {
-                self.joiner_decoder_proj.get_inputs()[
-                    0
-                ].name: decoder_out.numpy()
-            },
-        )[0]
-
-        return torch.from_numpy(projected_decoder_out)
 
 
 def create_streaming_feature_extractor() -> OnlineFeature:
@@ -358,7 +237,6 @@ def create_streaming_feature_extractor() -> OnlineFeature:
 def greedy_search(
     model: Model,
     encoder_out: torch.Tensor,
-    decoder_out: Optional[torch.Tensor] = None,
     hyp: Optional[List[int]] = None,
 ):
     assert encoder_out.ndim == 2
@@ -366,29 +244,19 @@ def greedy_search(
     context_size = 2
     blank_id = 0
 
-    if decoder_out is None:
-        assert hyp is None, hyp
+    if hyp is None:
         hyp = [blank_id] * context_size
-        decoder_input = torch.tensor(
-            [hyp], dtype=torch.int64
-        )  # (1, context_size)
-        decoder_out = model.run_decoder(decoder_input)
-    else:
-        assert decoder_out.shape[0] == 1
-        assert hyp is not None, hyp
 
-    projected_encoder_out = model.run_joiner_encoder_proj(encoder_out)
+    context = hyp[-context_size:]
+    context = torch.tensor([context], dtype=torch.int64)
 
-    joiner_out = model.run_joiner(projected_encoder_out, decoder_out)
+    joiner_out = model.run_joiner(context, encoder_out)
     y = joiner_out.squeeze(0).argmax(dim=0).item()
 
     if y != blank_id:
         hyp.append(y)
-        decoder_input = hyp[-context_size:]
-        decoder_input = torch.tensor([decoder_input], dtype=torch.int64)
-        decoder_out = model.run_decoder(decoder_input)
 
-    return hyp, decoder_out
+    return hyp
 
 
 def main():
@@ -401,7 +269,7 @@ def main():
     sample_rate = 16000
 
     sp = spm.SentencePieceProcessor()
-    sp.load(args.bpe_model_filename)
+    sp.load(args.bpe_model)
 
     logging.info("Constructing Fbank computer")
     online_fbank = create_streaming_feature_extractor()
@@ -422,7 +290,6 @@ def main():
     c0 = torch.zeros(num_encoder_layers, batch_size, rnn_hidden_size)
 
     hyp = None
-    decoder_out = None
 
     num_processed_frames = 0
     segment = 9
@@ -448,9 +315,7 @@ def main():
             num_processed_frames += offset
             frames = torch.cat(frames, dim=0).unsqueeze(0)
             encoder_out, h0, c0 = model.run_encoder(frames, h0, c0)
-            hyp, decoder_out = greedy_search(
-                model, encoder_out.squeeze(0), decoder_out, hyp
-            )
+            hyp = greedy_search(model, encoder_out.squeeze(0), hyp)
     online_fbank.accept_waveform(
         sampling_rate=sample_rate, waveform=torch.zeros(5000, dtype=torch.float)
     )
@@ -463,9 +328,7 @@ def main():
         num_processed_frames += offset
         frames = torch.cat(frames, dim=0).unsqueeze(0)
         encoder_out, h0, c0 = model.run_encoder(frames, h0, c0)
-        hyp, decoder_out = greedy_search(
-            model, encoder_out.squeeze(0), decoder_out, hyp
-        )
+        hyp = greedy_search(model, encoder_out.squeeze(0), hyp)
 
     context_size = 2
 

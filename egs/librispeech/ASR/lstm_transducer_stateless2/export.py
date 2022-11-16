@@ -102,6 +102,7 @@ for how to use the exported models outside of icefall.
 import argparse
 import logging
 from pathlib import Path
+from typing import Tuple
 
 import sentencepiece as spm
 import torch
@@ -306,213 +307,153 @@ def export_joiner_model_jit_trace(
     logging.info(f"Saved to {joiner_filename}")
 
 
-def export_encoder_model_onnx(
-    encoder_model: nn.Module,
-    encoder_filename: str,
-    opset_version: int = 11,
+class MergedEncoder(nn.Module):
+    """
+    This combines the encoder and joiner to provide a simplified model where
+    the encoder_out is pre-projected according to the joiner.
+    """
+
+    def __init__(self, encoder: nn.Module, joiner: nn.Module) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.encoder_proj = joiner.encoder_proj
+
+    def forward(
+        self, x: torch.Tensor, h: torch.Tensor, c: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        warmup = 1.0
+        x_lens = torch.tensor([9], dtype=torch.int64)
+
+        x, _, new_states = self.encoder(x, x_lens, (h, c), warmup)
+        x = self.encoder_proj(x)
+
+        return x, new_states[0], new_states[1]
+
+
+class MergedJoiner(nn.Module):
+    """
+    This combines the decoder and joiner to provide a simplified model that
+    takes context and pre-projected encoder_out as input, and then runs
+    decoder -> joiner.decoder_proj -> joiner sequentially.
+    """
+
+    def __init__(self, decoder: nn.Module, joiner: nn.Module) -> None:
+        super().__init__()
+        self.decoder = decoder
+        self.joiner = joiner
+
+    def forward(
+        self, context: torch.Tensor, encoder_out: torch.Tensor
+    ) -> torch.Tensor:
+        need_pad = False  # Always False, so we can use torch.jit.trace() here
+        project_input = False
+
+        decoder_out = self.decoder(context, need_pad)
+        decoder_out = self.joiner.decoder_proj(decoder_out)
+
+        joiner_out = self.joiner(encoder_out, decoder_out, project_input)
+
+        joiner_out = joiner_out.squeeze(0)
+
+        return joiner_out
+
+
+def export_model_onnx(
+    model: nn.Module, out_path: str, opset_version: int = 11
 ) -> None:
-    """Export the given encoder model to ONNX format.
-    The exported model has 3 inputs:
+    """Export the given model to ONNX format.
+    This exports the model as two networks:
+        - encoder.onnx, which combines the encoder and joiner's encoder_proj
+        - joiner.onnx, which combines the decoder, decoder_proj and joiner.
 
-        - x, a tensor of shape (N, T, C); dtype is torch.float32
-        - x_lens, a tensor of shape (N,); dtype is torch.int64
-        - states: a tuple containing:
-            - h0: a tensor of shape (num_layers, N, proj_size)
-            - c0: a tensor of shape (num_layers, N, hidden_size)
 
-    and it has 3 outputs:
+    The encoder network has 3 inputs:
+        - x: mel features, a tensor of shape (N, T, C); dtype is torch.float32
+        - h: hidden state, a tensor of shape (num_layers, N, proj_size)
+        - c: cell state, a tensor of shape (num_layers, N, hidden_size)
+    and has 3 outputs:
+        - encoder_out: a tensor of shape (N, T', joiner_dim)
+        - next_h: a tensor of shape (num_layers, N, proj_size)
+        - next_c: a tensor of shape (num_layers, N, hidden_size)
 
-        - encoder_out, a tensor of shape (N, T, C)
-        - encoder_out_lens, a tensor of shape (N,)
-        - states: a tuple containing:
-            - next_h0: a tensor of shape (num_layers, N, proj_size)
-            - next_c0: a tensor of shape (num_layers, N, hidden_size)
+    h0 and c0 should be initialized to zeros in the beginning. The outputs
+    next_h0 and next_c0 should be provided as h0 and c0 inputs in the
+    subsequent call.
 
     Note: The warmup argument is fixed to 1.
 
+
+    The joiner network has 2 inputs:
+        - context: a torch.int64 tensor of shape (N, decoder_model.context_size)
+        - encoder_out: a tensor of shape (N, joiner_dim)
+    and has one output:
+        - logit: a tensor of shape (N, vocab_size)
+
+
     Args:
-      encoder_model:
-        The input encoder model
-      encoder_filename:
-        The filename to save the exported ONNX model.
+      model:
+        The input model
+      out_path:
+        The path to save the exported ONNX models.
       opset_version:
         The opset version to use.
     """
+    encoder_filename = out_path / "encoder.onnx"
+    joiner_filename = out_path / "joiner.onnx"
+
+    onnx_encoder = MergedEncoder(model.encoder, model.joiner)
+    onnx_joiner = MergedJoiner(model.decoder, model.joiner)
+    onnx_encoder.eval()
+    onnx_joiner.eval()
+
     N = 1
-    x = torch.zeros(N, 9, 80, dtype=torch.float32)
-    x_lens = torch.tensor([9], dtype=torch.int64)
-    h = torch.rand(encoder_model.num_encoder_layers, N, encoder_model.d_model)
+    SEGMENT_SIZE = 9
+    MEL_FEATURES = 80
+
+    x = torch.zeros(N, SEGMENT_SIZE, MEL_FEATURES, dtype=torch.float32)
+    h = torch.rand(model.encoder.num_encoder_layers, N, model.encoder.d_model)
     c = torch.rand(
-        encoder_model.num_encoder_layers, N, encoder_model.rnn_hidden_size
+        model.encoder.num_encoder_layers, N, model.encoder.rnn_hidden_size
     )
 
-    warmup = 1.0
     torch.onnx.export(
-        encoder_model,  # use torch.jit.trace() internally
-        (x, x_lens, (h, c), warmup),
+        onnx_encoder,  # use torch.jit.trace() internally
+        (x, h, c),
         encoder_filename,
         verbose=False,
         opset_version=opset_version,
-        input_names=["x", "x_lens", "h", "c", "warmup"],
-        output_names=["encoder_out", "encoder_out_lens", "next_h", "next_c"],
+        input_names=["x", "h", "c"],
+        output_names=["encoder_out", "next_h", "next_c"],
         dynamic_axes={
             "x": {0: "N", 1: "T"},
-            "x_lens": {0: "N"},
             "h": {1: "N"},
             "c": {1: "N"},
-            "encoder_out": {0: "N", 1: "T"},
-            "encoder_out_lens": {0: "N"},
+            "encoder_out": {0: "N", 1: "T'"},
             "next_h": {1: "N"},
             "next_c": {1: "N"},
         },
     )
     logging.info(f"Saved to {encoder_filename}")
 
+    context = torch.zeros(N, model.decoder.context_size, dtype=torch.int64)
+    encoder_out, _, _ = onnx_encoder(x, h, c)
+    encoder_out = encoder_out.squeeze(0)
 
-def export_decoder_model_onnx(
-    decoder_model: nn.Module,
-    decoder_filename: str,
-    opset_version: int = 11,
-) -> None:
-    """Export the decoder model to ONNX format.
-
-    The exported model has one input:
-
-        - y: a torch.int64 tensor of shape (N, decoder_model.context_size)
-
-    and has one output:
-
-        - decoder_out: a torch.float32 tensor of shape (N, 1, C)
-
-    Note: The argument need_pad is fixed to False.
-
-    Args:
-      decoder_model:
-        The decoder model to be exported.
-      decoder_filename:
-        Filename to save the exported ONNX model.
-      opset_version:
-        The opset version to use.
-    """
-    y = torch.zeros(10, decoder_model.context_size, dtype=torch.int64)
-    need_pad = False  # Always False, so we can use torch.jit.trace() here
-    # Note(fangjun): torch.jit.trace() is more efficient than torch.jit.script()
-    # in this case
     torch.onnx.export(
-        decoder_model,
-        (y, need_pad),
-        decoder_filename,
-        verbose=False,
-        opset_version=opset_version,
-        input_names=["y", "need_pad"],
-        output_names=["decoder_out"],
-        dynamic_axes={
-            "y": {0: "N"},
-            "decoder_out": {0: "N"},
-        },
-    )
-    logging.info(f"Saved to {decoder_filename}")
-
-
-def export_joiner_model_onnx(
-    joiner_model: nn.Module,
-    joiner_filename: str,
-    opset_version: int = 11,
-) -> None:
-    """Export the joiner model to ONNX format.
-    The exported joiner model has two inputs:
-
-        - projected_encoder_out: a tensor of shape (N, joiner_dim)
-        - projected_decoder_out: a tensor of shape (N, joiner_dim)
-
-    and produces one output:
-
-        - logit: a tensor of shape (N, vocab_size)
-
-    The exported encoder_proj model has one input:
-
-        - encoder_out: a tensor of shape (N, encoder_out_dim)
-
-    and produces one output:
-
-        - projected_encoder_out: a tensor of shape (N, joiner_dim)
-
-    The exported decoder_proj model has one input:
-
-        - decoder_out: a tensor of shape (N, decoder_out_dim)
-
-    and produces one output:
-
-        - projected_decoder_out: a tensor of shape (N, joiner_dim)
-    """
-    encoder_proj_filename = str(joiner_filename).replace(
-        ".onnx", "_encoder_proj.onnx"
-    )
-
-    decoder_proj_filename = str(joiner_filename).replace(
-        ".onnx", "_decoder_proj.onnx"
-    )
-
-    encoder_out_dim = joiner_model.encoder_proj.weight.shape[1]
-    decoder_out_dim = joiner_model.decoder_proj.weight.shape[1]
-    joiner_dim = joiner_model.decoder_proj.weight.shape[0]
-
-    projected_encoder_out = torch.rand(1, joiner_dim, dtype=torch.float32)
-    projected_decoder_out = torch.rand(1, joiner_dim, dtype=torch.float32)
-
-    project_input = False
-    # Note: It uses torch.jit.trace() internally
-    torch.onnx.export(
-        joiner_model,
-        (projected_encoder_out, projected_decoder_out, project_input),
+        onnx_joiner,  # use torch.jit.trace() internally
+        (context, encoder_out),
         joiner_filename,
         verbose=False,
         opset_version=opset_version,
-        input_names=[
-            "projected_encoder_out",
-            "projected_decoder_out",
-            "project_input",
-        ],
-        output_names=["logit"],
+        input_names=["context", "encoder_out"],
+        output_names=["logits"],
         dynamic_axes={
-            "projected_encoder_out": {0: "N"},
-            "projected_decoder_out": {0: "N"},
-            "logit": {0: "N"},
+            "context": {0: "N"},
+            "encoder_out": {0: "N"},
+            "logits": {0: "N"},
         },
     )
     logging.info(f"Saved to {joiner_filename}")
-
-    encoder_out = torch.rand(1, encoder_out_dim, dtype=torch.float32)
-    torch.onnx.export(
-        joiner_model.encoder_proj,
-        encoder_out,
-        encoder_proj_filename,
-        verbose=False,
-        opset_version=opset_version,
-        input_names=["encoder_out"],
-        output_names=["projected_encoder_out"],
-        dynamic_axes={
-            "encoder_out": {0: "N"},
-            "projected_encoder_out": {0: "N"},
-        },
-    )
-    logging.info(f"Saved to {encoder_proj_filename}")
-
-    decoder_out = torch.rand(1, decoder_out_dim, dtype=torch.float32)
-    torch.onnx.export(
-        joiner_model.decoder_proj,
-        decoder_out,
-        decoder_proj_filename,
-        verbose=False,
-        opset_version=opset_version,
-        input_names=["decoder_out"],
-        output_names=["projected_decoder_out"],
-        dynamic_axes={
-            "decoder_out": {0: "N"},
-            "projected_decoder_out": {0: "N"},
-        },
-    )
-    logging.info(f"Saved to {decoder_proj_filename}")
 
 
 @torch.no_grad()
@@ -641,24 +582,9 @@ def main():
         convert_scaled_to_non_scaled(model, inplace=True, is_onnx=True)
 
         opset_version = 11
-        encoder_filename = params.exp_dir / "encoder.onnx"
-        export_encoder_model_onnx(
-            model.encoder,
-            encoder_filename,
-            opset_version=opset_version,
-        )
-
-        decoder_filename = params.exp_dir / "decoder.onnx"
-        export_decoder_model_onnx(
-            model.decoder,
-            decoder_filename,
-            opset_version=opset_version,
-        )
-
-        joiner_filename = params.exp_dir / "joiner.onnx"
-        export_joiner_model_onnx(
-            model.joiner,
-            joiner_filename,
+        export_model_onnx(
+            model,
+            params.exp_dir,
             opset_version=opset_version,
         )
 
