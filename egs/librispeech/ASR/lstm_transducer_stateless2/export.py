@@ -147,20 +147,24 @@ def get_parser():
         "--avg",
         type=int,
         default=15,
-        help="Number of checkpoints to average. Automatically select "
-        "consecutive checkpoints before the checkpoint specified by "
-        "'--epoch' and '--iter'",
+        help=(
+            "Number of checkpoints to average. Automatically select "
+            "consecutive checkpoints before the checkpoint specified by "
+            "'--epoch' and '--iter'"
+        ),
     )
 
     parser.add_argument(
         "--use-averaged-model",
         type=str2bool,
         default=True,
-        help="Whether to load averaged model. Currently it only supports "
-        "using --epoch. If True, it would decode with the averaged model "
-        "over the epoch range from `epoch-avg` (excluded) to `epoch`."
-        "Actually only the models with epoch number of `epoch-avg` and "
-        "`epoch` are loaded for averaging. ",
+        help=(
+            "Whether to load averaged model. Currently it only supports "
+            "using --epoch. If True, it would decode with the averaged model "
+            "over the epoch range from `epoch-avg` (excluded) to `epoch`."
+            "Actually only the models with epoch number of `epoch-avg` and "
+            "`epoch` are loaded for averaging. "
+        ),
     )
 
     parser.add_argument(
@@ -226,8 +230,7 @@ def get_parser():
         "--context-size",
         type=int,
         default=2,
-        help="The context size in the decoder. 1 means bigram; "
-        "2 means tri-gram",
+        help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
     )
 
     add_model_arguments(parser)
@@ -352,9 +355,7 @@ class MergedDecoder(nn.Module):
         return decoder_out
 
 
-def export_model_onnx(
-    model: nn.Module, out_path: str, opset_version: int = 11
-) -> None:
+def export_model_onnx(model: nn.Module, out_path: str, opset_version: int = 11) -> None:
     """Export the given model to ONNX format.
     This exports the model as 3 networks:
         - encoder.onnx, which combines the encoder and joiner's encoder_proj
@@ -414,9 +415,7 @@ def export_model_onnx(
     # Export encoder
     x = torch.zeros(N, SEGMENT_SIZE, MEL_FEATURES, dtype=torch.float32)
     h = torch.rand(model.encoder.num_encoder_layers, N, model.encoder.d_model)
-    c = torch.rand(
-        model.encoder.num_encoder_layers, N, model.encoder.rnn_hidden_size
-    )
+    c = torch.rand(model.encoder.num_encoder_layers, N, model.encoder.rnn_hidden_size)
     torch.onnx.export(
         onnx_encoder,  # use torch.jit.trace() internally
         (x, h, c),
@@ -458,7 +457,6 @@ def export_model_onnx(
     encoder_out = encoder_out.squeeze(0)
 
     decoder_out = onnx_decoder(context)
-    decoder_out = decoder_out.squeeze(1)
 
     project_input = False
 
@@ -514,13 +512,12 @@ def main():
 
     if not params.use_averaged_model:
         if params.iter > 0:
-            filenames = find_checkpoints(
-                params.exp_dir, iteration=-params.iter
-            )[: params.avg]
+            filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
+                : params.avg
+            ]
             if len(filenames) == 0:
                 raise ValueError(
-                    f"No checkpoints found for"
-                    f" --iter {params.iter}, --avg {params.avg}"
+                    f"No checkpoints found for --iter {params.iter}, --avg {params.avg}"
                 )
             elif len(filenames) < params.avg:
                 raise ValueError(
@@ -549,13 +546,12 @@ def main():
             )
     else:
         if params.iter > 0:
-            filenames = find_checkpoints(
-                params.exp_dir, iteration=-params.iter
-            )[: params.avg + 1]
+            filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
+                : params.avg + 1
+            ]
             if len(filenames) == 0:
                 raise ValueError(
-                    f"No checkpoints found for"
-                    f" --iter {params.iter}, --avg {params.avg}"
+                    f"No checkpoints found for --iter {params.iter}, --avg {params.avg}"
                 )
             elif len(filenames) < params.avg + 1:
                 raise ValueError(
@@ -584,7 +580,7 @@ def main():
             filename_start = f"{params.exp_dir}/epoch-{start}.pt"
             filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
             logging.info(
-                f"Calculating the averaged model over epoch range from "
+                "Calculating the averaged model over epoch range from "
                 f"{start} (excluded) to {params.epoch}"
             )
             model.to(device)
@@ -643,9 +639,7 @@ def main():
 
 
 if __name__ == "__main__":
-    formatter = (
-        "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-    )
+    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
 
     logging.basicConfig(format=formatter, level=logging.INFO)
     main()
